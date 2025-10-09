@@ -6,32 +6,22 @@ import multiprocessing
 import resource
 import re
 import time
-from typing import Tuple, List, Dict, Optional, Any
-
-# --- Safe & Useful Modules for Algorithmic Problems ---
-import math
-import itertools
-import functools
-import collections
-import heapq
+import importlib
+from typing import Tuple, List, Any
 
 # ----- Configuration -----
 MEMORY_BYTES = 256 * 1024 * 1024  # 256 MB per process
 TIMEOUT_SECONDS = 5
 MAX_WORKERS = 8  # Limit concurrency for batch execution
 
-# Allowed modules (users can safely import these)
-ALLOWED_IMPORTS = {"math", "itertools", "functools", "collections", "heapq"}
-
-# Blacklists
+# ----- Allowed / Disallowed modules and names -----
+ALLOWED_IMPORTS = {"math", "itertools", "functools", "collections", "heapq", "bisect", "operator", "statistics"}
 BLACKLIST_NAMES = {
     "os", "sys", "subprocess", "socket", "shutil", "ctypes",
     "multiprocessing", "threading", "pty", "signal", "resource",
     "winreg", "fcntl", "mmap"
 }
-
 BLACKLIST_CALLS = {"open", "eval", "exec", "compile", "__import__", "execfile"}
-
 BLACKLIST_PATTERNS = [
     r"__import__",
     r"\bos\b",
@@ -57,12 +47,14 @@ SAFE_BUILTINS = {
 
 # ---------- Static code checks ----------
 def _code_static_checks(code: str) -> Tuple[bool, List[str]]:
-    issues = []
+    issues: List[str] = []
 
+    # quick regex-based blacklist checks
     for pattern in BLACKLIST_PATTERNS:
         if re.search(pattern, code, flags=re.IGNORECASE):
             issues.append(f"Disallowed pattern detected: {pattern}")
 
+    # AST checks for more precise decisions
     try:
         tree = ast.parse(code, mode="exec")
     except Exception as e:
@@ -70,22 +62,30 @@ def _code_static_checks(code: str) -> Tuple[bool, List[str]]:
         return False, issues
 
     for node in ast.walk(tree):
-        # --- Import Checks ---
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
+        # Import statements: handle Import and ImportFrom separately
+        if isinstance(node, ast.Import):
             for alias in node.names:
-                mod_name = alias.name.split(".")[0]
-                if mod_name not in ALLOWED_IMPORTS:
-                    issues.append(f"Import of '{mod_name}' is not allowed.")
+                base = alias.name.split(".")[0]
+                if base not in ALLOWED_IMPORTS:
+                    issues.append(f"Import of '{base}' is not allowed.")
+        elif isinstance(node, ast.ImportFrom):
+            if node.module is None:
+                issues.append("Relative imports are not allowed.")
+            else:
+                base = node.module.split(".")[0]
+                if base not in ALLOWED_IMPORTS:
+                    issues.append(f"Import from '{node.module}' is not allowed.")
 
-        # --- Variable or Attribute Checks ---
+        # Disallowed names (e.g., 'os', 'sys', etc.)
         if isinstance(node, ast.Name) and node.id in BLACKLIST_NAMES:
             issues.append(f"Use of '{node.id}' is not allowed.")
 
+        # Attribute access on blacklisted names
         if isinstance(node, ast.Attribute):
             if isinstance(node.value, ast.Name) and node.value.id in BLACKLIST_NAMES:
                 issues.append(f"Attribute access on '{node.value.id}' is not allowed.")
 
-        # --- Function Call Checks ---
+        # Disallowed calls (open, eval, exec, __import__, etc.)
         if isinstance(node, ast.Call):
             func = node.func
             func_name = None
@@ -100,48 +100,61 @@ def _code_static_checks(code: str) -> Tuple[bool, List[str]]:
 
     return len(issues) == 0, issues
 
-# ---------- Safe builtins ----------
+# ---------- Safe builtins and safe __import__ ----------
 def _make_safe_builtins():
     base_builtins = __builtins__
     builtin_obj = base_builtins if isinstance(base_builtins, dict) else base_builtins.__dict__
 
     safe = {name: builtin_obj[name] for name in SAFE_BUILTINS if name in builtin_obj}
 
-    # Allow class creation and __main__ context
+    # Allow class creation and module context
     safe["__build_class__"] = builtin_obj["__build_class__"]
     safe["__name__"] = "__main__"
+
+    # Provide a safe __import__ that only allows ALLOWED_IMPORTS
+    def _safe_import(name: str, globals=None, locals=None, fromlist=(), level=0):
+        base = name.split(".")[0]
+        if base not in ALLOWED_IMPORTS:
+            raise ImportError(f"Import of '{base}' is not allowed in sandbox.")
+        # use importlib to import the module
+        return importlib.import_module(name)
+
+    safe["__import__"] = _safe_import
 
     return safe
 
 # ---------- Run single user code ----------
 def _run_user_code(code: str, output_queue: multiprocessing.Queue):
     try:
-        # Memory limit
+        # enforce memory limit for this process
         resource.setrlimit(resource.RLIMIT_AS, (MEMORY_BYTES, MEMORY_BYTES))
 
-        # Capture stdout/stderr
+        # redirect stdout/stderr
         old_stdout, old_stderr = sys.stdout, sys.stderr
         sys.stdout = io.StringIO()
         sys.stderr = io.StringIO()
 
-        # Timer
         start_time = time.perf_counter()
-
-        # Restricted globals
         safe_builtins = _make_safe_builtins()
 
-        # Pre-import whitelisted safe modules
-        safe_globals = {"__builtins__": safe_builtins}
+        # prepare the namespace (globals and locals shared)
+        exec_globals: dict = {"__builtins__": safe_builtins}
+
+        # preload allowed modules into exec_globals (optional convenience)
         for mod in ALLOWED_IMPORTS:
-            safe_globals[mod] = __import__(mod)
+            try:
+                exec_globals[mod] = importlib.import_module(mod)
+            except Exception:
+                # if importlib fails here (very unlikely for stdlib), skip it;
+                # user import will still use our safe __import__
+                pass
 
-        # Execute user code
-        exec(code, safe_globals, {})
+        # execute user code in the same dict for globals and locals so helpers/classes are visible
+        exec(code, exec_globals, exec_globals)
 
-        # Execution info
         exec_time = time.perf_counter() - start_time
         usage = resource.getrusage(resource.RUSAGE_SELF)
-        mem_used = usage.ru_maxrss / 1024
+        mem_used = usage.ru_maxrss / 1024  # convert KB -> MB (Linux ru_maxrss is KB)
 
         out = sys.stdout.getvalue()
         err = sys.stderr.getvalue()
@@ -153,8 +166,11 @@ def _run_user_code(code: str, output_queue: multiprocessing.Queue):
     except Exception:
         output_queue.put(([], traceback.format_exc(), 0.0, 0.0))
     finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
+        try:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+        except Exception:
+            pass
 
 # ---------- Run single sandbox ----------
 def run_code_in_sandbox(code: str, timeout: int = TIMEOUT_SECONDS):
@@ -179,12 +195,8 @@ def run_code_in_sandbox(code: str, timeout: int = TIMEOUT_SECONDS):
 
     return q.get()
 
-# ---------- Batch runner for 3000 problems ----------
+# ---------- Batch runner for many problems ----------
 def run_multiple_problems(codes: List[str], timeout: int = TIMEOUT_SECONDS):
-    """
-    Run a list of problem codes safely using a multiprocessing pool.
-    Returns: [(output_lines, error_text, exec_time, mem_used), ...]
-    """
     def worker(code):
         return run_code_in_sandbox(code, timeout)
 
@@ -193,34 +205,65 @@ def run_multiple_problems(codes: List[str], timeout: int = TIMEOUT_SECONDS):
 
     return results
 
-
-# ---------- Example Usage ----------
+# ---------- Example usage ----------
 if __name__ == "__main__":
+    # Example demonstrating 'from collections import deque' now allowed
     sample_code = """
-import math
 from collections import deque
+import math
+
+class TreeNode:
+    def __init__(self, val=0, left=None, right=None):
+        self.val = val
+        self.left = left
+        self.right = right
+
+def array_to_tree(arr):
+    if not arr:
+        return None
+    root = TreeNode(arr[0])
+    q = deque([root])
+    i = 1
+    while q and i < len(arr):
+        node = q.popleft()
+        if i < len(arr) and arr[i] is not None:
+            node.left = TreeNode(arr[i]); q.append(node.left)
+        i += 1
+        if i < len(arr) and arr[i] is not None:
+            node.right = TreeNode(arr[i]); q.append(node.right)
+        i += 1
+    return root
+
+def tree_to_array(root):
+    if not root: return []
+    res = []; q = deque([root])
+    while q:
+        node = q.popleft()
+        if node:
+            res.append(node.val); q.append(node.left); q.append(node.right)
+        else:
+            res.append(None)
+    while res and res[-1] is None: res.pop()
+    return res
 
 class Solution:
-    def two_sum(self, nums, target):
-        for i in range(len(nums)):
-            for j in range(i + 1, len(nums)):
-                if nums[i] + nums[j] == target:
-                    return [i, j]
+    def binary_tree_inorder_traversal(self, root):
+        # simple inorder traversal returning list
+        def inorder(node):
+            if not node: return []
+            return inorder(node.left) + [node.val] + inorder(node.right)
+        return inorder(root)
 
-sol_obj = Solution()
-test_cases = [
-    {'input': {'nums': [2, 7, 11, 15], 'target': 9}, 'expected_output': [0, 1]},
-    {'input': {'nums': [3, 2, 4], 'target': 6}, 'expected_output': [1, 2]},
-    {'input': {'nums': [3, 3], 'target': 6}, 'expected_output': [0, 1]}
-]
-
-for data in test_cases:
-    ans = sol_obj.two_sum(**data['input'])
-    print(ans)
+sol = Solution()
+tests = [{'input': {'root': [1, None, 2, 3]}}, {'input': {'root': [1]}}, {'input': {'root': []}}]
+for t in tests:
+    t['input'] = {k: array_to_tree(v) if isinstance(v, list) else v for k, v in t['input'].items()}
+    out = sol.binary_tree_inorder_traversal(**t['input'])
+    print(tree_to_array(out) if isinstance(out, tuple) is False else out)
 """
 
-    output_lines, error_text, exec_time, mem_used = run_code_in_sandbox(sample_code)
-    print("Output:", output_lines)
-    print("Error:", error_text)
-    print("Execution Time:", exec_time)
-    print("Memory Used (MB):", mem_used)
+    out, err, t, mem = run_code_in_sandbox(sample_code)
+    print("Output:", out)
+    print("Error:", err)
+    print("Time:", t)
+    print("Mem (MB):", mem)
