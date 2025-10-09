@@ -115,7 +115,7 @@ def _run_user_code(code: str, output_queue: multiprocessing.Queue):
         exec_globals = {"__builtins__": safe_builtins}
 
         # Execute user code
-        exec(code, exec_globals, {})
+        exec(code, exec_globals)
 
         # Execution info
         exec_time = time.perf_counter() - start_time
