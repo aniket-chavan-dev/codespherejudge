@@ -9,8 +9,9 @@ import time
 from typing import Tuple, List
 
 # ----- Configuration -----
-MEMORY_BYTES = 256 * 1024 * 1024   # 256 MB
+MEMORY_BYTES = 256 * 1024 * 1024  # 256 MB per process
 TIMEOUT_SECONDS = 5
+MAX_WORKERS = 8  # Limit concurrency for batch execution
 
 BLACKLIST_NAMES = {
     "os", "sys", "subprocess", "socket", "shutil", "ctypes",
@@ -45,7 +46,7 @@ SAFE_BUILTINS = {
 }
 # -------------------------
 
-
+# ---------- Static code checks ----------
 def _code_static_checks(code: str) -> Tuple[bool, List[str]]:
     issues = []
 
@@ -82,41 +83,44 @@ def _code_static_checks(code: str) -> Tuple[bool, List[str]]:
 
     return len(issues) == 0, issues
 
-
+# ---------- Safe builtins ----------
 def _make_safe_builtins():
     base_builtins = __builtins__
     builtin_obj = base_builtins if isinstance(base_builtins, dict) else base_builtins.__dict__
 
     safe = {name: builtin_obj[name] for name in SAFE_BUILTINS if name in builtin_obj}
+
+    # Allow class creation and __main__ module context
+    safe['__build_class__'] = builtin_obj['__build_class__']
+    safe['__name__'] = "__main__"
+
     return safe
 
-
+# ---------- Run single user code ----------
 def _run_user_code(code: str, output_queue: multiprocessing.Queue):
     try:
-        # Apply memory limit
+        # Memory limit
         resource.setrlimit(resource.RLIMIT_AS, (MEMORY_BYTES, MEMORY_BYTES))
 
-        # Redirect stdout/stderr
+        # Capture stdout/stderr
         old_stdout, old_stderr = sys.stdout, sys.stderr
         sys.stdout = io.StringIO()
         sys.stderr = io.StringIO()
 
-        # Start timer
+        # Timer
         start_time = time.perf_counter()
 
-        # Prepare restricted globals
+        # Restricted globals
         safe_builtins = _make_safe_builtins()
         exec_globals = {"__builtins__": safe_builtins}
 
         # Execute user code
         exec(code, exec_globals, {})
 
-        # End timer
+        # Execution info
         exec_time = time.perf_counter() - start_time
-
-        # Get memory usage (in MB)
         usage = resource.getrusage(resource.RUSAGE_SELF)
-        mem_used = usage.ru_maxrss / 1024  # Convert KB → MB (Linux gives KB)
+        mem_used = usage.ru_maxrss / 1024
 
         out = sys.stdout.getvalue()
         err = sys.stderr.getvalue()
@@ -128,18 +132,11 @@ def _run_user_code(code: str, output_queue: multiprocessing.Queue):
     except Exception:
         output_queue.put(([], traceback.format_exc(), 0.0, 0.0))
     finally:
-        try:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-        except Exception:
-            pass
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
 
-
+# ---------- Run single sandbox ----------
 def run_code_in_sandbox(code: str, timeout: int = TIMEOUT_SECONDS):
-    """
-    Runs user code safely and returns:
-    (output_lines, error_text, exec_time_seconds, memory_used_MB)
-    """
     if not code or not code.strip():
         return [], "Error: Empty code", 0.0, 0.0
 
@@ -159,5 +156,46 @@ def run_code_in_sandbox(code: str, timeout: int = TIMEOUT_SECONDS):
     if q.empty():
         return [], "Error: No output captured (possible crash or blocked operation)", 0.0, 0.0
 
-    output_lines, err, exec_time, mem_used = q.get()
-    return output_lines, err, exec_time, mem_used
+    return q.get()
+
+# ---------- Batch runner for 3000 problems ----------
+def run_multiple_problems(codes: List[str], timeout: int = TIMEOUT_SECONDS):
+    """
+    Run a list of problem codes safely using a multiprocessing pool.
+    Returns: [(output_lines, error_text, exec_time, mem_used), ...]
+    """
+    def worker(code):
+        return run_code_in_sandbox(code, timeout)
+
+    with multiprocessing.Pool(processes=MAX_WORKERS) as pool:
+        results = pool.map(worker, codes)
+
+    return results
+
+# ---------- Example usage ----------
+if __name__ == "__main__":
+    sample_code = """
+class Solution:
+    def two_sum(self, nums, target):
+        for i in range(len(nums)):
+            for j in range(1, len(nums)):
+                if nums[i] + nums[j] == target:
+                    return [i, j]
+
+sol_obj = Solution()
+test_cases = [
+    {'input': {'nums': [2, 7, 11, 15], 'target': 9}, 'expected_output': [0, 1]},
+    {'input': {'nums': [3, 2, 4], 'target': 6}, 'expected_output': [1, 2]},
+    {'input': {'nums': [3, 3], 'target': 6}, 'expected_output': [0, 1]}
+]
+
+for data in test_cases:
+    ans = sol_obj.two_sum(**data['input'])
+    print(ans)
+"""
+
+    output_lines, error_text, exec_time, mem_used = run_code_in_sandbox(sample_code)
+    print("Output:", output_lines)
+    print("Error:", error_text)
+    print("Execution Time:", exec_time)
+    print("Memory Used (MB):", mem_used)
