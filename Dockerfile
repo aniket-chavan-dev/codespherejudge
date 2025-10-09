@@ -22,8 +22,8 @@ COPY app ./app
 RUN useradd -m sandboxuser
 USER sandboxuser
 
-# Expose port
+# Expose the default development port
 EXPOSE 8000
 
-# Start FastAPI using Uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# ✅ Start FastAPI using Render’s dynamic $PORT
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
