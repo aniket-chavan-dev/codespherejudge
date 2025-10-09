@@ -6,13 +6,24 @@ import multiprocessing
 import resource
 import re
 import time
-from typing import Tuple, List
+from typing import Tuple, List, Dict, Optional, Any
+
+# --- Safe & Useful Modules for Algorithmic Problems ---
+import math
+import itertools
+import functools
+import collections
+import heapq
 
 # ----- Configuration -----
 MEMORY_BYTES = 256 * 1024 * 1024  # 256 MB per process
 TIMEOUT_SECONDS = 5
 MAX_WORKERS = 8  # Limit concurrency for batch execution
 
+# Allowed modules (users can safely import these)
+ALLOWED_IMPORTS = {"math", "itertools", "functools", "collections", "heapq"}
+
+# Blacklists
 BLACKLIST_NAMES = {
     "os", "sys", "subprocess", "socket", "shutil", "ctypes",
     "multiprocessing", "threading", "pty", "signal", "resource",
@@ -22,8 +33,6 @@ BLACKLIST_NAMES = {
 BLACKLIST_CALLS = {"open", "eval", "exec", "compile", "__import__", "execfile"}
 
 BLACKLIST_PATTERNS = [
-    r"\bimport\b",
-    r"\bfrom\b",
     r"__import__",
     r"\bos\b",
     r"\bsys\b",
@@ -61,25 +70,33 @@ def _code_static_checks(code: str) -> Tuple[bool, List[str]]:
         return False, issues
 
     for node in ast.walk(tree):
+        # --- Import Checks ---
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            issues.append("Import statements are not allowed.")
+            for alias in node.names:
+                mod_name = alias.name.split(".")[0]
+                if mod_name not in ALLOWED_IMPORTS:
+                    issues.append(f"Import of '{mod_name}' is not allowed.")
+
+        # --- Variable or Attribute Checks ---
         if isinstance(node, ast.Name) and node.id in BLACKLIST_NAMES:
             issues.append(f"Use of '{node.id}' is not allowed.")
+
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id in BLACKLIST_NAMES:
+                issues.append(f"Attribute access on '{node.value.id}' is not allowed.")
+
+        # --- Function Call Checks ---
         if isinstance(node, ast.Call):
             func = node.func
             func_name = None
             if isinstance(func, ast.Name):
                 func_name = func.id
-            elif isinstance(func, ast.Attribute):
-                if isinstance(func.value, ast.Name):
-                    if func.value.id in BLACKLIST_NAMES:
-                        issues.append(f"Attribute call on '{func.value.id}' is not allowed.")
+            elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                if func.value.id in BLACKLIST_NAMES:
+                    issues.append(f"Attribute call on '{func.value.id}' is not allowed.")
                 func_name = func.attr
             if func_name and func_name in BLACKLIST_CALLS:
                 issues.append(f"Call to '{func_name}' is not allowed.")
-        if isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name) and node.value.id in BLACKLIST_NAMES:
-                issues.append(f"Attribute access on '{node.value.id}' is not allowed.")
 
     return len(issues) == 0, issues
 
@@ -90,9 +107,9 @@ def _make_safe_builtins():
 
     safe = {name: builtin_obj[name] for name in SAFE_BUILTINS if name in builtin_obj}
 
-    # Allow class creation and __main__ module context
-    safe['__build_class__'] = builtin_obj['__build_class__']
-    safe['__name__'] = "__main__"
+    # Allow class creation and __main__ context
+    safe["__build_class__"] = builtin_obj["__build_class__"]
+    safe["__name__"] = "__main__"
 
     return safe
 
@@ -112,10 +129,14 @@ def _run_user_code(code: str, output_queue: multiprocessing.Queue):
 
         # Restricted globals
         safe_builtins = _make_safe_builtins()
-        exec_globals = {"__builtins__": safe_builtins}
+
+        # Pre-import whitelisted safe modules
+        safe_globals = {"__builtins__": safe_builtins}
+        for mod in ALLOWED_IMPORTS:
+            safe_globals[mod] = __import__(mod)
 
         # Execute user code
-        exec(code, exec_globals)
+        exec(code, safe_globals, {})
 
         # Execution info
         exec_time = time.perf_counter() - start_time
@@ -172,13 +193,17 @@ def run_multiple_problems(codes: List[str], timeout: int = TIMEOUT_SECONDS):
 
     return results
 
-# ---------- Example usage ----------
+
+# ---------- Example Usage ----------
 if __name__ == "__main__":
     sample_code = """
+import math
+from collections import deque
+
 class Solution:
     def two_sum(self, nums, target):
         for i in range(len(nums)):
-            for j in range(1, len(nums)):
+            for j in range(i + 1, len(nums)):
                 if nums[i] + nums[j] == target:
                     return [i, j]
 
