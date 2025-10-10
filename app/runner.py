@@ -11,7 +11,7 @@ from typing import Tuple, List, Any
 
 # ----- Configuration -----
 MEMORY_BYTES = 256 * 1024 * 1024  # 256 MB per process
-TIMEOUT_SECONDS = 5
+TIMEOUT_SECONDS = 8
 MAX_WORKERS = 8  # Limit concurrency for batch execution
 
 # ----- Allowed / Disallowed modules and names -----
